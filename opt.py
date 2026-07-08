@@ -1,365 +1,131 @@
+import inspect
+
 import torch
-import torch.backends.cudnn as cudnn
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
-import os
-import time
-import argparse
-import json
-import datetime
-import numpy as np
-import yaml
-import random
-from pathlib import Path
-from loguru import logger
+
+from metrics import compute_metrics
+from utils import save_eval_images, save_sample_images
+from logger import MetricLogger, SmoothedValue
 
 
-from loss import FDULoss
-from optimizer import build_optimizer, build_scheduler
-from dataset import get_training_set, get_test_set
-from net import Model
-from opt import train_one_epoch, evaluate_fn
-import utils
+def _unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
 
 
-def get_args_parser():
-    parser = argparse.ArgumentParser(
-        "Low Light Image Enhancement Training", add_help=False
-    )
-    parser.add_argument("--batch-size", default=4, type=int)
-    parser.add_argument("--epochs", default=800, type=int)
-
-    parser.add_argument("--finetune", default="", help="finetune from checkpoint")
-
-    parser.add_argument(
-        "--world_size", default=1, type=int, help="number of distributed processes"
-    )
-    parser.add_argument(
-        "--dist_url", default="env://", help="url used to set up distributed training"
-    )
-    parser.add_argument("--local_rank", default=0, type=int)
-
-    parser.add_argument(
-        "--device", default="cpu", help="device to use for training / testing"
-    )
-    parser.add_argument("--seed", default=42, type=int)
-    parser.add_argument("--resume", default="", help="resume from checkpoint")
-    parser.add_argument(
-        "--start_epoch", default=0, type=int, metavar="N", help="start epoch"
-    )
-    parser.add_argument("--eval", action="store_true", help="Perform evaluation only")
-    parser.add_argument("--num_workers", default=0, type=int)
-
-    parser.add_argument(
-        "--cfg",
-        type=str,
-        default="configs/lol.yaml",
-        help="Path to config file",
-    )
-
-    parser.add_argument("--print_freq", default=1, type=int, help="print frequency")
-
-    return parser
+def _forward_with_optional_intermediates(model, inputs, loss_fn):
+    raw_model = _unwrap_model(model)
+    wants_intermediates = "return_intermediate" in inspect.signature(
+        raw_model.forward
+    ).parameters and getattr(loss_fn, "intermediate_enabled", False)
+    if wants_intermediates:
+        return model(inputs, return_intermediate=True)
+    return model(inputs), None
 
 
-def main(args, cfg):
-    model_dir = cfg["training"]["model_dir"]
-    log_dir = f"{model_dir}/log"
+def _compute_loss(loss_fn, model, pred_l, targets, intermediates):
+    params = inspect.signature(loss_fn.forward).parameters
+    if "model" in params or "intermediates" in params:
+        kwargs = {}
+        if "model" in params and getattr(loss_fn, "fourier_enabled", False):
+            kwargs["model"] = _unwrap_model(model)
+        if "intermediates" in params and intermediates is not None:
+            kwargs["intermediates"] = intermediates
+        return loss_fn(pred_l, targets, **kwargs)
+    return loss_fn(pred_l, targets)
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    is_distributed, rank, local_rank, world_size = utils.setup_distributed()
+def train_one_epoch(
+    args,
+    model,
+    data_loader,
+    optimizer,
+    epoch,
+    loss_fn,
+    print_freq=10,
+    log_dir="logs",
+):
+    """Train for one epoch"""
+    model.train()
 
-    if rank != 0:
-        logger.remove()
-        logger.add(lambda msg: None)
+    metric_logger = MetricLogger(delimiter="  ", log_dir=log_dir)
+    metric_logger.add_meter("lr", SmoothedValue(window_size=1, fmt="{value:.6f}"))
+    header = f"Train epoch: [{epoch}]"
 
-    model_dir = cfg.get("training", {}).get("model_dir", "outputs/islr_model")
-    log_dir = f"{model_dir}/log"
+    for batch_idx, batch in enumerate(
+        metric_logger.log_every(data_loader, print_freq, header)
+    ):
+        inputs = batch["inputs"].to(args.device)
+        targets = batch["targets"].to(args.device)
 
-    if is_distributed:
-        device = torch.device(f"cuda:{local_rank}")
-    else:
-        device = (
-            torch.device(args.device)
-            if args.device and (args.device.startswith("cuda") or args.device == "cpu")
-            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        pred_l, intermediates = _forward_with_optional_intermediates(
+            model, inputs, loss_fn
         )
 
-    args.device = device
+        loss_dict = _compute_loss(loss_fn, model, pred_l, targets, intermediates)
+        total_loss = loss_dict["total"]
 
-    seed = args.seed + utils.get_rank()
-    # Set seed
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    cudnn.benchmark = False
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
 
-    # Create datasets
-    cfg_data = cfg["data"]
-    train_data = get_training_set(cfg_data["root"], cfg_data)
-    test_data = get_test_set(cfg_data["root"], cfg_data)
+        if len(optimizer.param_groups) > 0 and "lr" in optimizer.param_groups[0]:
+            metric_logger.update(lr=float(optimizer.param_groups[0]["lr"]))
+        for loss_name, loss_value in loss_dict.items():
+            metric_logger.update(**{f"{loss_name}_loss": loss_value.item()})
 
-    train_sampler = None
-    test_sampler = None
-    if is_distributed:
-        train_sampler = DistributedSampler(train_data, shuffle=True)
-        test_sampler = DistributedSampler(test_data, shuffle=False)
+        if batch_idx % (print_freq * 5) == 0:
+            save_sample_images(
+                inputs, pred_l, targets, batch_idx, epoch, args.output_dir
+            )
 
-    train_dataloader = DataLoader(
-        train_data,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        collate_fn=train_data.data_collator
-        if hasattr(train_data, "data_collator")
-        else None,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
-        pin_memory=True,
-        drop_last=True,
-    )
+    metric_logger.synchronize_between_processes()
+    print(f"Train stats: {metric_logger}")
 
-    test_dataloader = DataLoader(
-        test_data,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        collate_fn=test_data.data_collator
-        if hasattr(test_data, "data_collator")
-        else None,
-        sampler=test_sampler,
-        pin_memory=True,
-    )
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
-    # Create model
-    model = Model(**cfg["model"])
-    model = model.to(device)
-    n_parameters = utils.count_model_parameters(model)
 
-    if is_distributed:
-        model = DDP(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            find_unused_parameters=True,
-        )
-        model_for_params = model.module
-    else:
-        model_for_params = model
+def evaluate_fn(
+    args,
+    data_loader,
+    model,
+    epoch,
+    loss_fn,
+    print_freq=100,
+    results_path=None,
+    log_dir="logs",
+):
+    """Evaluate model"""
+    model.eval()
 
-    n_parameters = utils.count_model_parameters(model_for_params)
+    metric_logger = MetricLogger(delimiter="  ", log_dir=log_dir)
+    header = f"Test: [{epoch}]"
 
-    # Create loss function
-    loss_weights = cfg["loss"]
-    loss_fn = FDULoss(loss_weights, device=device)
-    if rank == 0:
-        print(f"Number of parameters: {n_parameters}")
-
-        input_shape = (
-            args.batch_size,
-            3,
-            cfg_data["image_size"],
-            cfg_data["image_size"],
-        )
-        model_info = utils.get_model_info(model_for_params, input_shape, device)
-
-        print("Model Information:")
-        print(f"  Total parameters: {model_info['total_params']:,}")
-        print(f"  Trainable parameters: {model_info['trainable_params']:,}")
-        print(f"  Non-trainable parameters: {model_info['non_trainable_params']:,}")
-        print(f"  FLOPs: {model_info['flops_str']}")
-        print()
-    optimizer_config = cfg.get("training", {}).get("optimization", {})
-    optimizer = build_optimizer(config=optimizer_config, model=model_for_params)
-
-    for group in optimizer.param_groups:
-        if "initial_lr" not in group:
-            group["initial_lr"] = group["lr"]
-
-    if "training" not in cfg:
-        cfg["training"] = {}
-    if "optimization" not in cfg["training"]:
-        cfg["training"]["optimization"] = {}
-    cfg["training"]["optimization"]["total_epochs"] = args.epochs
-
-    scheduler_last_epoch = -1
-    if args.resume:
-        if rank == 0:
-            print(f"Resume training from {args.resume}")
-        ret, missing_keys, unexpected_keys, checkpoint = utils.load_pretrained_flexibly(
-            model_for_params, args.resume, device="cpu", strict=False
-        )
-        if rank == 0:
-            if missing_keys:
-                print(f"Missing keys in state dict: {missing_keys}")
-            if unexpected_keys:
-                print(f"Unexpected keys in state dict: {unexpected_keys}")
-
-        if isinstance(checkpoint, dict) and "epoch" in checkpoint:
-            scheduler_last_epoch = checkpoint["epoch"]
-            args.start_epoch = checkpoint["epoch"] + 1
-    else:
-        checkpoint = None
-
-    scheduler, scheduler_type = build_scheduler(
-        config=cfg["training"]["optimization"],
-        optimizer=optimizer,
-        last_epoch=scheduler_last_epoch,
-    )
-
-    if args.resume and checkpoint is not None:
-        if (
-            not args.eval
-            and "optimizer_state_dict" in checkpoint
-            and "scheduler_state_dict" in checkpoint
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(
+            metric_logger.log_every(data_loader, print_freq, header)
         ):
-            if rank == 0:
-                print("Loading optimizer and scheduler")
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            if hasattr(scheduler, "load_state_dict"):
-                scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            if rank == 0:
-                print(f"New learning rate : {scheduler.get_last_lr()[0]}")
+            inputs = batch["inputs"].to(args.device)
+            targets = batch["targets"].to(args.device)
+            filenames = batch["filenames"]
 
-    if args.finetune:
-        if rank == 0:
-            print(f"Fine tune training from {args.finetune}")
-        ret, missing_keys, unexpected_keys, _ = utils.load_pretrained_flexibly(
-            model_for_params, args.finetune, device="cpu", strict=False
-        )
-        if rank == 0:
-            if missing_keys:
-                print(f"Missing keys in state dict: {missing_keys}")
-            if unexpected_keys:
-                print(f"Unexpected keys in state dict: {unexpected_keys}")
-
-    args.output_dir = model_dir
-    args.save_images = cfg.get("evaluation", {}).get("save_images", False)
-    output_dir = Path(model_dir)
-
-    # Add loss function and output directory to args
-    args.output_dir = model_dir
-    args.save_images = cfg["evaluation"]["save_images"]
-
-    output_dir = Path(cfg["training"]["model_dir"])
-
-    if args.eval:
-        if not args.resume:
-            logger.warning(
-                "Please specify the trained model: --resume /path/to/best_checkpoint.pth"
+            pred_l, intermediates = _forward_with_optional_intermediates(
+                model, inputs, loss_fn
             )
+            pred_l = pred_l.clamp(0.0, 1.0)
+            if intermediates is not None:
+                intermediates = [inter.clamp(0.0, 1.0) for inter in intermediates]
 
-        test_results = evaluate_fn(
-            args,
-            test_dataloader,
-            model,
-            epoch=0,
-            loss_fn=loss_fn,
-            print_freq=args.print_freq,
-            results_path=f"{model_dir}/test_results.json",
-            log_dir=f"{log_dir}_eval_test",
-        )
-        if rank == 0:
-            print(
-                f"Test loss of the network on the {len(test_dataloader)} test images: {test_results['psnr']:.3f} PSNR"
-            )
-            print(f"* TEST SSIM {test_results['ssim']:.3f}")
-        return
+            loss_dict = _compute_loss(loss_fn, model, pred_l, targets, intermediates)
+            for loss_name, loss_value in loss_dict.items():
+                metric_logger.update(**{f"{loss_name}_loss": loss_value.item()})
 
-    if rank == 0:
-        print(f"Training on {device}")
-        print(
-            f"Start training for {args.epochs} epochs and start epoch: {args.start_epoch}"
-        )
-    start_time = time.time()
-    best_psnr = 0.0
+            metrics = compute_metrics(targets, pred_l, args.device)
+            for metric_name, metric_value in metrics.items():
+                metric_logger.update(**{f"{metric_name}": metric_value})
 
-    for epoch in range(args.start_epoch, args.epochs):
-        if rank == 0:
-            logger.info(f"Epoch {epoch} of {args.epochs}")
-        train_results = train_one_epoch(
-            args,
-            model,
-            train_dataloader,
-            optimizer,
-            epoch,
-            loss_fn,
-            print_freq=args.print_freq,
-            log_dir=f"{log_dir}/train",
-        )
-        scheduler.step()
+            if args.save_images:
+                save_eval_images(inputs, pred_l, targets, filenames, args.output_dir)
 
-        # Save checkpoint
-        checkpoint_paths = [output_dir / f"checkpoint_{epoch}.pth"]
-        prev_chkpt = output_dir / f"checkpoint_{epoch - 1}.pth"
-        if os.path.exists(prev_chkpt) and local_rank == 0:
-            os.remove(prev_chkpt)
-        for checkpoint_path in checkpoint_paths:
-            utils.save_on_master(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "epoch": epoch,
-                },
-                checkpoint_path,
-            )
-        print()
+    metric_logger.synchronize_between_processes()
+    print(f"Test stats: {metric_logger}")
 
-        # Evaluate
-        test_results = evaluate_fn(
-            args,
-            test_dataloader,
-            model,
-            epoch,
-            loss_fn,
-            print_freq=args.print_freq,
-            log_dir=f"{log_dir}/test",
-        )
-
-        # Save best model
-        if test_results["psnr"] > best_psnr:
-            best_psnr = test_results["psnr"]
-            checkpoint_paths = [output_dir / "best_checkpoint.pth"]
-            for checkpoint_path in checkpoint_paths:
-                utils.save_on_master(
-                    {
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "scheduler_state_dict": scheduler.state_dict(),
-                        "epoch": epoch,
-                    },
-                    checkpoint_path,
-                )
-        if rank == 0:
-            print(f"* TEST PSNR {test_results['psnr']:.3f} Best PSNR {best_psnr:.3f}")
-
-        # Log results
-        log_results = {
-            **{f"train_{k}": v for k, v in train_results.items()},
-            **{f"test_{k}": v for k, v in test_results.items()},
-            "epoch": epoch,
-            "n_parameters": n_parameters,
-        }
-        print()
-        with (output_dir / "log.txt").open("a") as f:
-            f.write(json.dumps(log_results) + "\n")
-    if rank == 0:
-        total_time = time.time() - start_time
-        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        print("Training time {}".format(total_time_str))
-    utils.cleanup_distributed()
-
-
-if __name__ == "__main__":
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    parser = argparse.ArgumentParser(
-        "Low Light Enhancement", parents=[get_args_parser()]
-    )
-    args = parser.parse_args()
-
-    with open(args.cfg, "r+", encoding="utf-8") as f:
-        config = yaml.load(f, Loader=yaml.FullLoader)
-
-    Path(config["training"]["model_dir"]).mkdir(parents=True, exist_ok=True)
-    main(args, config)
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
