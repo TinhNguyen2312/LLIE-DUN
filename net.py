@@ -1,4 +1,3 @@
-# file: net.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -89,18 +88,15 @@ class FDUCore(nn.Module):
         b, c, h, w = low_light_img.shape
         assert c == 1, "FDUCore operates on a single real-valued channel."
 
-        # Z^(0) = F(I_l), Z^(-1) = Z^(0)
         x_prev2, y_prev2 = self._fft_real_imag(low_light_img)
-        x_prev1, y_prev1 = x_prev2, y_prev2
 
-        # gamma-corrected initial target estimate Z_n^(0)
         init_img = low_light_img.clamp(min=1e-6).pow(1.0 / self.gamma)
         x0, y0 = self._fft_real_imag(init_img)
 
         s_prev = torch.tensor(1.0, device=low_light_img.device)
         intermediates = [] if return_intermediate else None
 
-        x_cur, y_cur = x_prev1, y_prev1
+        x_cur, y_cur = x_prev2, y_prev2
         for k in range(self.num_stages):
             # momentum extrapolation
             s_next = (1.0 + torch.sqrt(1.0 + 4.0 * s_prev**2)) / 2.0
@@ -161,7 +157,7 @@ class Model(nn.Module):
 
     def forward(self, x, return_intermediate: bool = False):
         b, c, h, w = x.shape
-        assert c == 3, f"Model expects 3-channel RGB input, got {c} channels."
+        assert c == 3, f"NoirNetASP expects 3-channel RGB input, got {c} channels."
 
         channel_outputs = []
         channel_intermediates = [] if return_intermediate else None
@@ -202,9 +198,13 @@ class Model(nn.Module):
             y_list.append(spec.imag)
         return torch.cat(x_list, dim=1), torch.cat(y_list, dim=1)
 
-    @torch.no_grad()
     def get_fourier_prediction(self, enhanced_rgb):
-        return self.get_fourier_targets(enhanced_rgb)
+        x_list, y_list = [], []
+        for ch in range(3):
+            spec = torch.fft.fft2(enhanced_rgb[:, ch : ch + 1, :, :], norm="ortho")
+            x_list.append(spec.real)
+            y_list.append(spec.imag)
+        return torch.cat(x_list, dim=1), torch.cat(y_list, dim=1)
 
 
 if __name__ == "__main__":
