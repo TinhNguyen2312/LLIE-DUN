@@ -3,7 +3,7 @@ data:
   train_dir: "train" # root/train/{input_dir,target_dir}
   test_dir: "test" # root/test/{input_dir,target_dir}
   input_dir: "low" # folder of low-light images
-  target_dir: "high"
+  target_dir: "light"
   image_size: 256
 
 model:
