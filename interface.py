@@ -82,7 +82,7 @@ def main():
     parser.add_argument("-i", required=True, help="Directory containing input images")
     parser.add_argument("-m", required=True, help="Path to pretrained model checkpoint")
     parser.add_argument("-o", required=True, help="Directory to save enhanced images")
-    parser.add_argument("-c", default="./configs/lol.yaml", help="Path to config file")
+    parser.add_argument("-c", default="./configs/lol.yml", help="Path to config file")
     parser.add_argument("-d", default="cuda", help="Device to use (cuda/cpu)")
 
     args = parser.parse_args()
