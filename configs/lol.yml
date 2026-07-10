@@ -8,7 +8,7 @@ data:
 
 model:
   num_stages: 8
-  proxnet_hidden: 32
+  proxnet_hidden: 16
   proxnet_blocks: 4
   gamma: 2.2
   share_channel_weights: false
